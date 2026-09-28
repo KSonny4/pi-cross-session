@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { createServer as createTlsServer, type Server as TlsServer, type TLSSocket } from "node:tls";
 import { join } from "node:path";
 import { promisify, TextDecoder } from "node:util";
 import { CAPABILITY, RPC_SEND, RPC_INFO, RECEIVED, bridgeEnvelope, validId, validInstance, type SendRequest } from "../lib/contract";
@@ -12,6 +13,7 @@ import { CAPABILITY, RPC_SEND, RPC_INFO, RECEIVED, bridgeEnvelope, validId, vali
 import { MESH_CONTINUATION, MeshContinuations } from "../lib/mesh-continuation";
 import { GOAL_ENTRY, PeerGoals } from "../lib/peer-goal";
 import { socketPathFor as ipcSocketPathFor } from "../lib/ipc-path";
+import { REMOTE_CONFIG_FILENAME, formatEndpoint, gatewayServerOptions, loadRemoteConfig, remoteList, type RemoteConfig, type RemoteListedPeer } from "../lib/remote";
 
 const REGISTRATION_VERSION = 2;
 const WIRE_VERSION = 1;
@@ -60,6 +62,9 @@ type Peer = {
 
 type GitContext = { worktree: string; branch: string | null; head: string };
 type PublicPeer = Omit<Peer, "token"> & { ref: string; git?: GitContext | null };
+// Slice 1 remote entry: the display subset served by a peer gateway.
+// Never sendable: send() resolves only local livePeers().
+type RemotePeer = RemoteListedPeer & { machine: string };
 
 type HelloFrame = {
   v: 1;
@@ -187,10 +192,11 @@ async function gitContext(cwd: string): Promise<GitContext | null> {
   }
 }
 
-function displayPeer(peer: Peer | PublicPeer) {
+function displayPeer(peer: Peer | PublicPeer | RemotePeer) {
   const git = "git" in peer ? peer.git : undefined;
   const suffix = git === undefined ? "" : git ? ` — git ${cleanLine(git.worktree, 500)} (${cleanLine(git.branch ?? "detached", 200)}@${short(git.head)})` : " — git none";
-  return `${cleanName(peer.name)} [${"ref" in peer ? peer.ref : short(peer.instanceId)}] — ${peer.status} — ${cleanLine(peer.cwd, 500)}${suffix} — session ${cleanLine(peer.id, 200)}`;
+  const via = "machine" in peer && typeof peer.machine === "string" ? ` — remote ${peer.machine}` : "";
+  return `${cleanName(peer.name)} [${"ref" in peer ? peer.ref : short(peer.instanceId)}] — ${peer.status} — ${cleanLine(peer.cwd, 500)}${suffix}${via} — session ${cleanLine(peer.id, 200)}`;
 }
 
 function equalSecret(left: unknown, right: string) {
@@ -469,6 +475,13 @@ export default function (pi: ExtensionAPI) {
   let authoritySessionId: string | undefined;
   const observes = (ctx: ExtensionContext) => authoritySessionId !== undefined && ctx.sessionManager.getSessionId() === authoritySessionId;
   let server: Server | undefined;
+  let remoteServer: TlsServer | undefined;
+  let remoteListening = false;
+  let remoteStarting = false;
+  let remoteConfig: RemoteConfig | undefined;
+  let remoteNotified = "";
+  const remoteClients = new Set<TLSSocket>();
+  const remoteEnabled = () => pi.getFlag("cross-session-remote") === true;
   let heartbeat: NodeJS.Timeout | undefined;
   let registrationWrites = Promise.resolve();
   let budget = TOTAL_BUDGET;
@@ -517,6 +530,7 @@ export default function (pi: ExtensionAPI) {
   const seenTexts = new Map<string, number>();
 
   pi.registerFlag("cross-session-rpc", { description: "Enable trusted Host-only EventBus RPC/handled bridge admission", type: "boolean", default: false });
+  pi.registerFlag("cross-session-remote", { description: "List live Pi sessions on LAN/ZeroTier peer gateways over TLS-PSK (default off)", type: "boolean", default: false });
   pi.registerFlag("cross-session-inbound", {
     description: "Accept or refuse messages from other Pi sessions",
     type: "string",
@@ -886,12 +900,152 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function closeServer() {
-    if (!server) return;
-    const active = server;
-    server = undefined;
-    for (const client of clients) client.destroy();
-    clients.clear();
+    if (server) {
+      const active = server;
+      server = undefined;
+      for (const client of clients) client.destroy();
+      clients.clear();
+      await new Promise<void>((resolve) => active.close(() => resolve())).catch(() => {});
+    }
+    await closeRemoteServer();
+  }
+
+  async function closeRemoteServer() {
+    if (!remoteServer) {
+      remoteListening = false;
+      for (const client of remoteClients) client.destroy();
+      remoteClients.clear();
+      return;
+    }
+    const active = remoteServer;
+    remoteServer = undefined;
+    remoteListening = false;
+    for (const client of remoteClients) client.destroy();
+    remoteClients.clear();
     await new Promise<void>((resolve) => active.close(() => resolve())).catch(() => {});
+  }
+
+  function notifyRemote(message: string) {
+    if (remoteNotified === message) return;
+    remoteNotified = message;
+    try { currentCtx?.ui.notify(`Cross-session remote disabled: ${message}`, "error"); } catch { /* best effort */ }
+  }
+
+  // One gateway per machine: the flagged session that binds listen serves
+  // remote-list. EADDRINUSE means another local session is the gateway (not
+  // an error); the heartbeat retries so a new session takes over on exit.
+  async function ensureRemoteGateway() {
+    if (!remoteEnabled() || shuttingDown || !current || remoteListening || remoteStarting) return;
+    if (!remoteConfig) {
+      const loaded = await loadRemoteConfig(agentDir);
+      if (loaded.status === "error") { notifyRemote(loaded.error); return; }
+      if (loaded.status === "absent") { notifyRemote(`${REMOTE_CONFIG_FILENAME} not found in agent dir`); return; }
+      remoteConfig = loaded.config;
+    }
+    const config = remoteConfig;
+    remoteStarting = true;
+    try {
+      const gateway = createTlsServer(gatewayServerOptions(config.psk), handleRemoteConnection);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onError = (error: Error) => reject(error);
+          gateway.once("error", onError);
+          gateway.listen({ host: config.listen.host, port: config.listen.port }, () => {
+            gateway.off("error", onError);
+            resolve();
+          });
+        });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") {
+          notifyRemote(`gateway unavailable on ${formatEndpoint(config.listen)}: ${(error as Error).message}`);
+        }
+        return;
+      }
+      if (shuttingDown || !current) { gateway.close(); return; }
+      remoteServer = gateway;
+      remoteListening = true;
+      gateway.on("error", (error) => { try { currentCtx?.ui.notify(`Cross-session remote inbox error: ${error.message}`, "error"); } catch { /* best effort */ } });
+      gateway.unref();
+    } finally {
+      remoteStarting = false;
+    }
+  }
+
+  // Slice 1 gateway: answers only remote-list as the first frame. Any other
+  // first frame gets an error response and the connection closes.
+  function handleRemoteConnection(socket: TLSSocket) {
+    if (shuttingDown || remoteClients.size >= 64) { socket.destroy(); return; }
+    const incarnation = current?.instanceId;
+    remoteClients.add(socket);
+    const replyTimer = setTimeout(() => socket.destroy(), FIRST_LINE_TIMEOUT_MS);
+    replyTimer.unref();
+    let finished = false;
+    const done = (frame: object) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(replyTimer);
+      try { socket.write(encodeFrame(frame)); socket.end(); } catch { socket.destroy(); }
+    };
+    const fail = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(replyTimer);
+      socket.destroy();
+    };
+    socket.on("error", () => {});
+    socket.on("close", () => { clearTimeout(replyTimer); remoteClients.delete(socket); });
+    socket.on("data", frameReader(line => {
+      if (finished) return false;
+      let value: unknown;
+      try { value = JSON.parse(line); } catch { fail(); return false; }
+      const frame = value as { v?: unknown; type?: unknown; requestId?: unknown } | null;
+      const requestId = typeof frame?.requestId === "string" && validId(frame.requestId) ? frame.requestId : "unknown";
+      if (!frame || frame.v !== WIRE_VERSION || frame.type !== "remote-list" || requestId === "unknown") {
+        done({ v: WIRE_VERSION, type: "response", requestId, ok: false, status: "unsupported", error: "Slice 1 gateway answers only remote-list as the first frame" });
+        return false;
+      }
+      void (async () => {
+        if (finished || shuttingDown || current?.instanceId !== incarnation) return;
+        try {
+          const peers = await livePeers();
+          if (finished || shuttingDown || current?.instanceId !== incarnation) return;
+          done({
+            v: WIRE_VERSION, type: "response", requestId, ok: true, status: "listed",
+            peers: peers.map(peer => ({
+              id: peer.id, instanceId: peer.instanceId, name: peer.name,
+              status: peer.status, cwd: peer.cwd, ref: short(peer.instanceId),
+            })),
+          });
+        } catch (error) {
+          done({ v: WIRE_VERSION, type: "response", requestId, ok: false, status: "transient", error: error instanceof Error ? error.message : String(error) });
+        }
+      })();
+      return false;
+    }, fail));
+  }
+
+  // Parallel PROBE-scale queries; per-gateway failures are diagnostics, never throw.
+  async function queryRemotePeers(): Promise<{ peers: RemotePeer[]; diagnostics: string[] }> {
+    if (!remoteEnabled() || !remoteConfig || shuttingDown) return { peers: [], diagnostics: [] };
+    const config = remoteConfig;
+    const targets = config.peers.filter(target => !(target.host === config.listen.host && target.port === config.listen.port));
+    const settled = await Promise.all(targets.map(async (target) => {
+      const label = formatEndpoint(target);
+      try {
+        const listed: RemoteListedPeer[] = await remoteList(target.host, target.port, config.psk, PROBE_TIMEOUT_MS);
+        return { peers: listed.map(peer => ({ ...peer, ref: short(peer.instanceId), machine: label })), diagnostic: undefined as string | undefined };
+      } catch (error) {
+        return { peers: [] as RemotePeer[], diagnostic: `remote ${label}: ${cleanLine(error instanceof Error ? error.message : String(error), 120)}` };
+      }
+    }));
+    return { peers: settled.flatMap(row => row.peers), diagnostics: settled.map(row => row.diagnostic).filter((line): line is string => !!line) };
+  }
+
+  async function fullListing() {
+    const listing = await peersListing(await livePeers());
+    if (!remoteEnabled() || !remoteConfig) return listing;
+    const remote = await queryRemotePeers();
+    return { self: listing.self, peers: [...listing.peers, ...remote.peers], remoteDiagnostics: remote.diagnostics };
   }
 
   async function removePeer(peer: Peer) {
@@ -981,9 +1135,11 @@ export default function (pi: ExtensionAPI) {
     return { self, peers: listed };
   }
 
-  function peersText(self: PublicPeer | null, peers: PublicPeer[]) {
+  function peersText(self: PublicPeer | null, peers: (PublicPeer | RemotePeer)[], remoteDiagnostics: string[] = []) {
     const currentText = self ? `This session: ${displayPeer(self)}` : "This session: cross-session inbox unavailable";
-    return `${currentText}\n${peers.length ? peers.map(displayPeer).join("\n") : "No other live Pi sessions."}`;
+    const lines = peers.length ? peers.map(displayPeer).join("\n") : "No other live Pi sessions.";
+    const diagnostics = remoteDiagnostics.length ? `\n${remoteDiagnostics.join("\n")}` : "";
+    return `${currentText}\n${lines}${diagnostics}`;
   }
 
   pi.registerMessageRenderer("cross-session", (message, { expanded, outputPad }, theme) => {
@@ -1009,9 +1165,9 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "List other live Pi sessions when a coordination target is not explicit",
     parameters: Type.Object({}),
     async execute() {
-      const listing = await peersListing(await livePeers());
+      const listing = await fullListing();
       return {
-        content: [{ type: "text", text: peersText(listing.self, listing.peers) }],
+        content: [{ type: "text", text: peersText(listing.self, listing.peers, "remoteDiagnostics" in listing ? listing.remoteDiagnostics : []) }],
         details: listing,
       };
     },
@@ -1099,12 +1255,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("peers", {
     description: "List other live Pi sessions",
-    handler: async (_args, ctx) => { const listing = await peersListing(await livePeers()); ctx.ui.notify(peersText(listing.self, listing.peers), "info"); },
+    handler: async (_args, ctx) => { const listing = await fullListing(); ctx.ui.notify(peersText(listing.self, listing.peers, "remoteDiagnostics" in listing ? listing.remoteDiagnostics : []), "info"); },
   });
 
   pi.registerCommand("list-pi", {
     description: "Alias for /peers",
-    handler: async (_args, ctx) => { const listing = await peersListing(await livePeers()); ctx.ui.notify(peersText(listing.self, listing.peers), "info"); },
+    handler: async (_args, ctx) => { const listing = await fullListing(); ctx.ui.notify(peersText(listing.self, listing.peers, "remoteDiagnostics" in listing ? listing.remoteDiagnostics : []), "info"); },
   });
 
   pi.on("session_start", (_event, ctx) => {
@@ -1186,9 +1342,11 @@ export default function (pi: ExtensionAPI) {
       if (shuttingDown || epoch !== startingEpoch) { await cleanup(); return; }
       await writeRegistration(ctx);
       if (shuttingDown || epoch !== startingEpoch) { await cleanup(); return; }
+      await ensureRemoteGateway();
+      if (shuttingDown || epoch !== startingEpoch) { await cleanup(); return; }
       authoritySessionId = sessionId;
       offContinuation = pi.events.on(MESH_CONTINUATION, request => continuations.issue(request));
-      heartbeat = setInterval(() => void writeRegistration().catch(() => { void cleanup(); }), HEARTBEAT_MS);
+      heartbeat = setInterval(() => { void writeRegistration().catch(() => { void cleanup(); }); void ensureRemoteGateway().catch(() => {}); }, HEARTBEAT_MS);
       heartbeat.unref();
       void livePeers().catch(() => {});
     } catch (error) {
