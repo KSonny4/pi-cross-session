@@ -88,7 +88,7 @@ Each machine uses the same `<agentDir>/cross-session-remote.json` file (alongsid
 }
 ```
 
-Generate the key with `openssl rand -hex 32` and copy the file to every machine. `listen` and `peers` are IP literals only (IPv6 as `[addr]:port`); the gateway binds exactly `listen`, never `0.0.0.0`/`::`. The first flagged session to bind `listen` becomes that machine's gateway (the rest retry on the 30 s heartbeat); the gateway serves only `remote-list` over TLS 1.2 with the pre-shared key — mutual auth plus encryption, no certificates, no extra dependencies.
+Generate the key with `openssl rand -hex 32`. Every machine shares the same `psk` and the same `peers` list, but `listen` is per-machine: set it to that machine's own IP (e.g. `10.147.17.5:7717` above, `10.147.17.9:7717` on the other host). `listen` and `peers` are IP literals only (IPv6 as `[addr]:port`); the gateway binds exactly `listen`, never `0.0.0.0`/`::`. The first flagged session to bind `listen` becomes that machine's gateway (the rest retry on the 30 s heartbeat); the gateway serves only `remote-list` over TLS 1.2 with the pre-shared key — mutual auth plus encryption, no certificates, no extra dependencies.
 
 Security boundary: anyone holding the PSK is trusted like the same OS user is today. A PSK holder can claim any remote session identity, but never a local one. The PSK file is a secret, like the registration tokens.
 

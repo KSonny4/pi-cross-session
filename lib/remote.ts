@@ -14,9 +14,9 @@ import { TextDecoder } from "node:util";
 
 export const REMOTE_CONFIG_FILENAME = "cross-session-remote.json";
 export const REMOTE_MAX_CONFIG_BYTES = 64 * 1024;
-export const REMOTE_MAX_FRAME_BYTES = 1_048_576; // Mirrors the local wire frame cap.
-export const REMOTE_MAX_PEERS = 64;
+export const MAX_FRAME_BYTES = 1_048_576; // Shared local/remote wire frame cap.
 export const REMOTE_PSK_IDENTITY = "pi-cross-session";
+export const REMOTE_LIST_TIMEOUT_MS = 2_000;
 // Node's pskCallback does not do TLS 1.3 PSK, so pin TLS 1.2 with PSK ciphers.
 export const REMOTE_CIPHERS = "ECDHE-PSK-CHACHA20-POLY1305:PSK-AES256-GCM-SHA384";
 
@@ -51,7 +51,7 @@ export function parseHostPort(value: unknown): RemoteEndpoint | null {
   }
   const family = isIP(host);
   if (family !== 4 && family !== 6) return null;
-  if (host === "0.0.0.0" || host === "::") return null;
+  if (/^(::ffff:)?[0:.]+$/i.test(host)) return null;
   const port = Number(portText);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
   return { host, port };
@@ -82,9 +82,6 @@ export function validateRemoteConfig(value: unknown): RemoteConfigValidation {
   }
   const peersRaw = raw.peers ?? [];
   if (!Array.isArray(peersRaw)) return invalid("remote config 'peers' must be an array of IP-literal host:port endpoints");
-  if (peersRaw.length > REMOTE_MAX_PEERS) {
-    return invalid(`remote config 'peers' lists more than ${REMOTE_MAX_PEERS} endpoints`);
-  }
   const peers: RemoteEndpoint[] = [];
   for (const entry of peersRaw) {
     const parsed = parseHostPort(entry);
@@ -148,6 +145,7 @@ export function gatewayServerOptions(psk: string): TlsOptions {
     minVersion: "TLSv1.2",
     maxVersion: "TLSv1.2",
     ciphers: REMOTE_CIPHERS,
+    handshakeTimeout: 5_000,
     pskCallback: (_socket, identity) =>
       String(identity ?? "") === REMOTE_PSK_IDENTITY ? key : null,
   };
@@ -160,6 +158,29 @@ export function remoteClientOptions(): ConnectionOptions {
     maxVersion: "TLSv1.2",
     ciphers: REMOTE_CIPHERS,
     checkServerIdentity: () => undefined, // PSK authenticates the server.
+  };
+}
+
+// Shared wire reader: limit RAW bytes per frame (including LF/BOM), not decoded
+// text or a whole coalesced chunk. Deliver preceding frames before a later fault.
+export function frameReader(onLine: (line: string) => boolean, onError: (code: string) => void) {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let text = "", bytes = 0, stopped = false;
+  return (chunk: Buffer) => {
+    for (let offset = 0; offset < chunk.length && !stopped;) {
+      const newline = chunk.indexOf(10, offset);
+      const end = newline < 0 ? chunk.length : newline + 1;
+      const part = chunk.subarray(offset, end);
+      bytes += part.length;
+      if (bytes > MAX_FRAME_BYTES) { stopped = true; onError("message_too_large"); return; }
+      try { text += decoder.decode(part, { stream: true }); }
+      catch { stopped = true; onError("invalid_frame"); return; }
+      offset = end;
+      if (newline >= 0) {
+        const line = text.slice(0, -1); text = ""; bytes = 0;
+        stopped = !onLine(line);
+      }
+    }
   };
 }
 
@@ -202,9 +223,34 @@ export async function remoteList(
       Math.max(1, timeoutMs),
     );
     timer.unref();
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    let text = "";
-    let bytes = 0;
+    const reader = frameReader(
+      (text) => {
+        if (settled) return false;
+        let value: unknown;
+        try {
+          value = JSON.parse(text);
+        } catch {
+          value = null;
+        }
+        const frame = value as {
+          v?: unknown; type?: unknown; requestId?: unknown;
+          ok?: unknown; status?: unknown; peers?: unknown;
+        } | null;
+        // One validity check: a non-JSON, mismatched, refused, or non-listing
+        // frame is a diagnostic, never a throw site for callers.
+        if (!frame || frame.v !== 1 || frame.type !== "response" || frame.requestId !== requestId || frame.ok !== true || frame.status !== "listed" || !Array.isArray(frame.peers)) {
+          fail("invalid_response", `remote-list response from ${label} is not a valid listing`);
+          return false;
+        }
+        const peers = frame.peers.filter(isRemoteListedPeer);
+        settled = true;
+        clearTimeout(timer);
+        socket?.destroy();
+        resolve(peers);
+        return false;
+      },
+      (code) => fail(code, `remote-list response from ${label} is not a valid frame (${code})`),
+    );
     socket = connect({
       host,
       port,
@@ -214,50 +260,7 @@ export async function remoteList(
     socket.on("secureConnect", () => {
       if (!settled) socket?.write(line);
     });
-    socket.on("data", (chunk: Buffer) => {
-      if (settled) return;
-      bytes += chunk.length;
-      if (bytes > REMOTE_MAX_FRAME_BYTES) {
-        fail("message_too_large", `remote-list response from ${label} exceeds frame cap`);
-        return;
-      }
-      try {
-        text += decoder.decode(chunk, { stream: true });
-      } catch {
-        fail("invalid_frame", `remote-list response from ${label} is not valid UTF-8`);
-        return;
-      }
-      const newline = text.indexOf("\n");
-      if (newline < 0) return;
-      let value: unknown;
-      try {
-        value = JSON.parse(text.slice(0, newline));
-      } catch {
-        fail("invalid_response", `remote-list response from ${label} is not JSON`);
-        return;
-      }
-      const frame = value as {
-        v?: unknown; type?: unknown; requestId?: unknown;
-        ok?: unknown; status?: unknown; error?: unknown; peers?: unknown;
-      } | null;
-      if (!frame || frame.v !== 1 || frame.type !== "response" || frame.requestId !== requestId) {
-        fail("invalid_response", `remote-list response from ${label} does not match this request`);
-        return;
-      }
-      if (frame.ok !== true) {
-        fail(String(frame.status ?? "refused"), String(typeof frame.error === "string" ? frame.error : `gateway refused remote-list (${label})`));
-        return;
-      }
-      if (frame.status !== "listed" || !Array.isArray(frame.peers)) {
-        fail("invalid_response", `remote-list response from ${label} is not a listing`);
-        return;
-      }
-      const peers = frame.peers.filter(isRemoteListedPeer);
-      settled = true;
-      clearTimeout(timer);
-      socket?.destroy();
-      resolve(peers);
-    });
+    socket.on("data", reader);
     socket.on("error", (error) => {
       const code = (error as NodeJS.ErrnoException).code ?? "transport_error";
       fail(code, `${label}: ${error.message}`);

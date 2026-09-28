@@ -24,6 +24,7 @@ test('remote config validation: accepts valid, rejects bad shapes', () => {
   for (const [label, config] of [
     ['hostname listen', { ...validConfig(), listen: 'example.com:7717' }],
     ['unspecified listen', { ...validConfig(), listen: '0.0.0.0:7717' }],
+    ['unspecified ipv6 listen', { ...validConfig(), listen: '[::0]:7717' }],
     ['short psk', { ...validConfig(), psk: 'abc' }],
     ['uppercase psk', { ...validConfig(), psk: 'AB'.repeat(32) }],
     ['hostname peer', { ...validConfig(), peers: ['peer.local:7717'] }],

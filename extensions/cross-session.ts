@@ -7,18 +7,17 @@ import { chmod, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "n
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { createServer as createTlsServer, type Server as TlsServer, type TLSSocket } from "node:tls";
 import { join } from "node:path";
-import { promisify, TextDecoder } from "node:util";
+import { promisify } from "node:util";
 import { CAPABILITY, RPC_SEND, RPC_INFO, RECEIVED, bridgeEnvelope, validId, validInstance, type SendRequest } from "../lib/contract";
 
 import { MESH_CONTINUATION, MeshContinuations } from "../lib/mesh-continuation";
 import { GOAL_ENTRY, PeerGoals } from "../lib/peer-goal";
 import { socketPathFor as ipcSocketPathFor } from "../lib/ipc-path";
-import { REMOTE_CONFIG_FILENAME, formatEndpoint, gatewayServerOptions, loadRemoteConfig, remoteList, type RemoteConfig, type RemoteListedPeer } from "../lib/remote";
+import { MAX_FRAME_BYTES, REMOTE_CONFIG_FILENAME, REMOTE_LIST_TIMEOUT_MS, formatEndpoint, frameReader, gatewayServerOptions, loadRemoteConfig, remoteList, type RemoteConfig, type RemoteListedPeer } from "../lib/remote";
 
 const REGISTRATION_VERSION = 2;
 const WIRE_VERSION = 1;
 const GOAL_CAPABILITY = "goal-scoped-peer-v1";
-const MAX_FRAME_BYTES = 1_048_576;
 const MAX_MESSAGE_CHARS = 1_000_000;
 const MAX_REGISTRATION_BYTES = 64 * 1024;
 const MAX_PENDING = 50;
@@ -176,7 +175,7 @@ function short(value: string, length = 8) {
 }
 
 function publicPeer(peer: Peer, git?: GitContext | null): PublicPeer {
-  const { token: _token, ...rest } = peer;
+  const { token: _token, machine: _stray, ...rest } = peer as Peer & { machine?: unknown };
   return { ...rest, ref: short(peer.instanceId), ...(git !== undefined && { git }) };
 }
 
@@ -192,10 +191,13 @@ async function gitContext(cwd: string): Promise<GitContext | null> {
   }
 }
 
-function displayPeer(peer: Peer | PublicPeer | RemotePeer) {
+// The remote marker comes only from an explicit machine argument, set solely
+// by remote listing entries: never sniff the peer object, since a stray
+// machine key in a local registration would otherwise render as remote.
+function displayPeer(peer: Peer | PublicPeer | RemotePeer, machine?: string) {
   const git = "git" in peer ? peer.git : undefined;
   const suffix = git === undefined ? "" : git ? ` — git ${cleanLine(git.worktree, 500)} (${cleanLine(git.branch ?? "detached", 200)}@${short(git.head)})` : " — git none";
-  const via = "machine" in peer && typeof peer.machine === "string" ? ` — remote ${peer.machine}` : "";
+  const via = typeof machine === "string" && machine ? ` — remote ${machine}` : "";
   return `${cleanName(peer.name)} [${"ref" in peer ? peer.ref : short(peer.instanceId)}] — ${peer.status} — ${cleanLine(peer.cwd, 500)}${suffix}${via} — session ${cleanLine(peer.id, 200)}`;
 }
 
@@ -210,29 +212,6 @@ function encodeFrame(frame: object) {
     throw new DeliveryError("message_too_large", `Serialized cross-session message exceeds ${MAX_FRAME_BYTES.toLocaleString("en-US")} bytes`);
   }
   return line;
-}
-
-// Shared wire reader: limit RAW bytes per frame (including LF/BOM), not decoded
-// text or a whole coalesced chunk. Deliver preceding frames before a later fault.
-function frameReader(onLine: (line: string) => boolean, onError: (code: string) => void) {
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  let text = "", bytes = 0, stopped = false;
-  return (chunk: Buffer) => {
-    for (let offset = 0; offset < chunk.length && !stopped;) {
-      const newline = chunk.indexOf(10, offset);
-      const end = newline < 0 ? chunk.length : newline + 1;
-      const part = chunk.subarray(offset, end);
-      bytes += part.length;
-      if (bytes > MAX_FRAME_BYTES) { stopped = true; onError("message_too_large"); return; }
-      try { text += decoder.decode(part, { stream: true }); }
-      catch { stopped = true; onError("invalid_frame"); return; }
-      offset = end;
-      if (newline >= 0) {
-        const line = text.slice(0, -1); text = ""; bytes = 0;
-        stopped = !onLine(line);
-      }
-    }
-  };
 }
 
 function validCapabilities(value: unknown) {
@@ -476,7 +455,6 @@ export default function (pi: ExtensionAPI) {
   const observes = (ctx: ExtensionContext) => authoritySessionId !== undefined && ctx.sessionManager.getSessionId() === authoritySessionId;
   let server: Server | undefined;
   let remoteServer: TlsServer | undefined;
-  let remoteListening = false;
   let remoteStarting = false;
   let remoteConfig: RemoteConfig | undefined;
   let remoteNotified = "";
@@ -900,29 +878,21 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function closeServer() {
-    if (server) {
-      const active = server;
-      server = undefined;
-      for (const client of clients) client.destroy();
-      clients.clear();
-      await new Promise<void>((resolve) => active.close(() => resolve())).catch(() => {});
-    }
     await closeRemoteServer();
+    if (!server) return;
+    const active = server;
+    server = undefined;
+    for (const client of clients) client.destroy();
+    clients.clear();
+    await new Promise<void>((resolve) => active.close(() => resolve())).catch(() => {});
   }
 
   async function closeRemoteServer() {
-    if (!remoteServer) {
-      remoteListening = false;
-      for (const client of remoteClients) client.destroy();
-      remoteClients.clear();
-      return;
-    }
     const active = remoteServer;
     remoteServer = undefined;
-    remoteListening = false;
     for (const client of remoteClients) client.destroy();
     remoteClients.clear();
-    await new Promise<void>((resolve) => active.close(() => resolve())).catch(() => {});
+    if (active) await new Promise<void>((resolve) => active.close(() => resolve())).catch(() => {});
   }
 
   function notifyRemote(message: string) {
@@ -935,7 +905,7 @@ export default function (pi: ExtensionAPI) {
   // remote-list. EADDRINUSE means another local session is the gateway (not
   // an error); the heartbeat retries so a new session takes over on exit.
   async function ensureRemoteGateway() {
-    if (!remoteEnabled() || shuttingDown || !current || remoteListening || remoteStarting) return;
+    if (!remoteEnabled() || shuttingDown || !current || remoteServer !== undefined || remoteStarting) return;
     if (!remoteConfig) {
       const loaded = await loadRemoteConfig(agentDir);
       if (loaded.status === "error") { notifyRemote(loaded.error); return; }
@@ -946,6 +916,7 @@ export default function (pi: ExtensionAPI) {
     remoteStarting = true;
     try {
       const gateway = createTlsServer(gatewayServerOptions(config.psk), handleRemoteConnection);
+      gateway.maxConnections = 64;
       try {
         await new Promise<void>((resolve, reject) => {
           const onError = (error: Error) => reject(error);
@@ -963,7 +934,6 @@ export default function (pi: ExtensionAPI) {
       }
       if (shuttingDown || !current) { gateway.close(); return; }
       remoteServer = gateway;
-      remoteListening = true;
       gateway.on("error", (error) => { try { currentCtx?.ui.notify(`Cross-session remote inbox error: ${error.message}`, "error"); } catch { /* best effort */ } });
       gateway.unref();
     } finally {
@@ -1035,7 +1005,7 @@ export default function (pi: ExtensionAPI) {
     const settled = await Promise.all(targets.map(async (target) => {
       const label = formatEndpoint(target);
       try {
-        const listed: RemoteListedPeer[] = await remoteList(target.host, target.port, config.psk, PROBE_TIMEOUT_MS);
+        const listed: RemoteListedPeer[] = await remoteList(target.host, target.port, config.psk, REMOTE_LIST_TIMEOUT_MS);
         return { peers: listed.map(peer => ({ ...peer, ref: short(peer.instanceId), machine: label })), diagnostic: undefined as string | undefined };
       } catch (error) {
         return { peers: [] as RemotePeer[], diagnostic: `remote ${label}: ${cleanLine(error instanceof Error ? error.message : String(error), 120)}` };
@@ -1045,10 +1015,15 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function fullListing() {
-    const listing = await peersListing(await livePeers());
+    const peers = await livePeers();
+    const listing = await peersListing(peers);
     if (!remoteEnabled() || !remoteConfig) return listing;
     const remote = await queryRemotePeers();
-    return { self: listing.self, peers: [...listing.peers, ...remote.peers], remoteDiagnostics: remote.diagnostics };
+    // A machine reachable via two IPs (e.g. LAN + ZeroTier) must not list
+    // its own sessions as remote: drop anything already known locally.
+    const localIds = new Set([current?.instanceId, ...peers.map(peer => peer.instanceId)]);
+    const fresh = remote.peers.filter(peer => !localIds.has(peer.instanceId));
+    return { self: listing.self, peers: [...listing.peers, ...fresh], remoteDiagnostics: remote.diagnostics };
   }
 
   async function removePeer(peer: Peer) {
@@ -1093,7 +1068,7 @@ export default function (pi: ExtensionAPI) {
       return peer.name === trimmed || peer.id === trimmed || peer.instanceId === trimmed || runtimeRef;
     });
     if (matches.length === 0) throw new DeliveryError("not_found", `No live Pi session named or identified by: ${target}`);
-    if (matches.length > 1) throw new DeliveryError("ambiguous", `Ambiguous session; use name [ref]: ${matches.map(displayPeer).join(" | ")}`);
+    if (matches.length > 1) throw new DeliveryError("ambiguous", `Ambiguous session; use name [ref]: ${matches.map(peer => displayPeer(peer)).join(" | ")}`);
 
     if (shuttingDown || current?.instanceId !== incarnation || sendingSignal.aborted) throw new DeliveryError("not_ready", "Local incarnation changed/cancelled before send");
     const peer = matches[0];
@@ -1138,9 +1113,10 @@ export default function (pi: ExtensionAPI) {
     return { self, peers: listed };
   }
 
-  function peersText(self: PublicPeer | null, peers: (PublicPeer | RemotePeer)[], remoteDiagnostics: string[] = []) {
-    const currentText = self ? `This session: ${displayPeer(self)}` : "This session: cross-session inbox unavailable";
-    const lines = peers.length ? peers.map(displayPeer).join("\n") : "No other live Pi sessions.";
+  function peersText(listing: { self: PublicPeer | null; peers: (PublicPeer | RemotePeer)[]; remoteDiagnostics?: string[] }) {
+    const currentText = listing.self ? `This session: ${displayPeer(listing.self)}` : "This session: cross-session inbox unavailable";
+    const lines = listing.peers.length ? listing.peers.map(peer => displayPeer(peer, (peer as Partial<RemotePeer>).machine)).join("\n") : "No other live Pi sessions.";
+    const remoteDiagnostics = listing.remoteDiagnostics ?? [];
     const diagnostics = remoteDiagnostics.length ? `\n${remoteDiagnostics.join("\n")}` : "";
     return `${currentText}\n${lines}${diagnostics}`;
   }
@@ -1170,7 +1146,7 @@ export default function (pi: ExtensionAPI) {
     async execute() {
       const listing = await fullListing();
       return {
-        content: [{ type: "text", text: peersText(listing.self, listing.peers, "remoteDiagnostics" in listing ? listing.remoteDiagnostics : []) }],
+        content: [{ type: "text", text: peersText(listing) }],
         details: listing,
       };
     },
@@ -1258,12 +1234,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("peers", {
     description: "List other live Pi sessions",
-    handler: async (_args, ctx) => { const listing = await fullListing(); ctx.ui.notify(peersText(listing.self, listing.peers, "remoteDiagnostics" in listing ? listing.remoteDiagnostics : []), "info"); },
+    handler: async (_args, ctx) => { const listing = await fullListing(); ctx.ui.notify(peersText(listing), "info"); },
   });
 
   pi.registerCommand("list-pi", {
     description: "Alias for /peers",
-    handler: async (_args, ctx) => { const listing = await fullListing(); ctx.ui.notify(peersText(listing.self, listing.peers, "remoteDiagnostics" in listing ? listing.remoteDiagnostics : []), "info"); },
+    handler: async (_args, ctx) => { const listing = await fullListing(); ctx.ui.notify(peersText(listing), "info"); },
   });
 
   pi.on("session_start", (_event, ctx) => {
@@ -1345,8 +1321,10 @@ export default function (pi: ExtensionAPI) {
       if (shuttingDown || epoch !== startingEpoch) { await cleanup(); return; }
       await writeRegistration(ctx);
       if (shuttingDown || epoch !== startingEpoch) { await cleanup(); return; }
-      await ensureRemoteGateway();
-      if (shuttingDown || epoch !== startingEpoch) { await cleanup(); return; }
+      if (remoteEnabled()) {
+        await ensureRemoteGateway();
+        if (shuttingDown || epoch !== startingEpoch) { await cleanup(); return; }
+      }
       authoritySessionId = sessionId;
       offContinuation = pi.events.on(MESH_CONTINUATION, request => continuations.issue(request));
       heartbeat = setInterval(() => { void writeRegistration().catch(() => { void cleanup(); }); void ensureRemoteGateway().catch(() => {}); }, HEARTBEAT_MS);
