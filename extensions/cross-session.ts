@@ -255,13 +255,12 @@ function isHello(value: unknown): value is HelloFrame {
         typeof from.instanceId === "string" &&
         /^[0-9a-f]{32}$/.test(from.instanceId) &&
         (
-          from.remote === true
-            ? from.token === undefined &&
-              typeof from.name === "string" &&
-              from.name.length > 0 && from.name.length <= 512 && codePointLength(from.name) <= 200 &&
-              (from.machine === undefined ||
-                (typeof from.machine === "string" && from.machine.length > 0 && from.machine.length <= 64))
-            : typeof from.token === "string"
+          typeof from.token === "string" ||
+          (from.remote === true && from.token === undefined &&
+            typeof from.name === "string" &&
+            from.name.length > 0 && from.name.length <= 512 && codePointLength(from.name) <= 200 &&
+            (from.machine === undefined ||
+              (typeof from.machine === "string" && from.machine.length > 0 && from.machine.length <= 64)))
         )
       )
     )
@@ -763,10 +762,10 @@ export default function (pi: ExtensionAPI) {
     if (!current || frame.target.id !== current.id || frame.target.instanceId !== current.instanceId || !equalSecret(frame.token, current.token)) return null;
     if (!frame.from) return undefined;
     const from = frame.from as HelloFromLocal | HelloFromRemote;
-    if ((from as HelloFromRemote).remote === true) {
+    if (typeof (from as HelloFromLocal).token !== "string") {
       const remote = from as HelloFromRemote;
       if (!remoteEnabled()) return null;
-      if (typeof remote.machine !== "string" || remote.machine.length === 0 || remote.machine.length > 64 || !isIP(remote.machine)) return null;
+      if (typeof remote.machine !== "string" || !isIP(remote.machine)) return null;
       if (remote.instanceId === current.instanceId) return null;
       if (await readPeer(remote.instanceId)) return null;
       const now = Date.now();
@@ -834,7 +833,7 @@ export default function (pi: ExtensionAPI) {
         if (shuttingDown || current?.instanceId !== incarnation || socket.destroyed) return;
         safeQueue = Array.isArray(value.capabilities) && value.capabilities.includes(CAPABILITY);
         sender = peer;
-        if ((value.from as HelloFromRemote | undefined)?.remote === true) senderMachine = (value.from as HelloFromRemote).machine;
+        if (value.from && typeof (value.from as HelloFromLocal).token !== "string") senderMachine = (value.from as HelloFromRemote).machine;
         authenticated = true;
         socket.setTimeout(SEND_TIMEOUT_MS, () => socket.destroy());
         response(socket, value.requestId, true, "ready");
@@ -1088,20 +1087,13 @@ export default function (pi: ExtensionAPI) {
           local.once("error", reject);
         });
       } catch (error) {
-        (local! as Socket)?.destroy();
+        local!?.destroy();
         done({ v: WIRE_VERSION, type: "response", requestId: clientHello.requestId, ok: false, status: "transient", error: error instanceof Error ? error.message : String(error) });
         return;
       }
       if (finished || shuttingDown || socket.destroyed || local!.destroyed) { local!.destroy(); return; }
       localSocket = local!;
-      try {
-        localSocket.write(`${JSON.stringify(rewritten)}\n`);
-      } catch (error) {
-        const failing = localSocket; localSocket = undefined;
-        failing?.destroy();
-        done({ v: WIRE_VERSION, type: "response", requestId: clientHello.requestId, ok: false, status: "transient", error: error instanceof Error ? error.message : String(error) });
-        return;
-      }
+      localSocket.write(`${JSON.stringify(rewritten)}\n`);
       socket.pipe(localSocket);
       localSocket.pipe(socket);
       localSocket.once("close", () => { socket.destroy(); });
@@ -1153,7 +1145,7 @@ export default function (pi: ExtensionAPI) {
       const label = formatEndpoint(target);
       try {
         const listed: RemoteListedPeer[] = await remoteList(target.host, target.port, config.psk, REMOTE_LIST_TIMEOUT_MS);
-        return { peers: listed.map(peer => ({ ...peer, ref: short(peer.instanceId), machine: label })), diagnostic: undefined as string | undefined };
+        return { peers: listed.map(({ id, instanceId, name, status, cwd }) => ({ id, instanceId, name, status, cwd, ref: short(instanceId), machine: label })), diagnostic: undefined as string | undefined };
       } catch (error) {
         return { peers: [] as RemotePeer[], diagnostic: `remote ${label}: ${cleanLine(error instanceof Error ? error.message : String(error), 120)}` };
       }

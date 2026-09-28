@@ -396,5 +396,8 @@ test('flag off: real remote target not_found with no connection; remote hello to
     const reply = await wire(null, off, null, { hello });
     assert.equal(reply.ok, false);
     assert.equal(reply.status, 'authentication_failed');
+    // A local-form hello (valid token) with a stray remote key is still local, as before slice 2.
+    const local = { ...hello, requestId: randomUUID(), from: { id: off.peer.id, instanceId: off.peer.instanceId, token: off.peer.token, remote: true } };
+    assert.equal((await wire(null, off, null, { hello: local })).ok, true);
   } finally { await off.close(); }
 });
