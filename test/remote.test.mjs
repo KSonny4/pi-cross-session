@@ -14,6 +14,7 @@ import { repo, until } from './support/sdk.mjs';
 const PSK = 'ab'.repeat(32);
 const PORT_A = 17771, PORT_B = 17772, PORT_C = 17773, PORT_GW = 17778, PORT_OFF = 17779;
 const SEND_A = 17781, SEND_B = 17782, SEND_OFF = 17784;
+const PORT_REAL = 17785, PORT_PXY = 17786, PORT_REJ = 17788;
 
 function validConfig(port = PORT_GW, psk = PSK, peers = []) {
   return { listen: `127.0.0.1:${port}`, psk, peers };
@@ -304,15 +305,91 @@ test('remote rejects: wrong psk, goal scope, spoofed local identity, unknown tar
   } finally { await closeWorkers([A, B]); }
 });
 
-test('flag off: remote send not_found no listener; remote hello to unix socket rejected', { timeout: 30000 }, async () => {
+test('stray machine key in a local registration never renders as remote', { timeout: 30000 }, async () => {
+  const { component } = await import('./support/component.mjs');
+  const a = await component('stray-a');
+  const b = await component('stray-b');
+  const c = await component('stray-b');
+  try {
+    const file = path.join(process.env.PI_CODING_AGENT_DIR, 'peers', `${b.peer.instanceId}.json`);
+    const reg = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+    await fs.promises.writeFile(file, JSON.stringify({ ...reg, machine: '10.0.0.9:7717' }));
+    const sent = await a.tool('send_pi_message', { target: b.peer.instanceId, message: 'local hello' });
+    const detailsJson = JSON.stringify(sent.details);
+    assert.ok(!/[0-9a-f]{64}/.test(detailsJson), detailsJson);
+    assert.ok(!detailsJson.includes('remote'), detailsJson);
+    assert.ok(!('token' in sent.details.target) && !('machine' in sent.details.target), detailsJson);
+    await until(() => b.calls.some(call => call.message.details?.text === 'local hello'), 'local delivery');
+    const got = b.calls.find(call => call.message.details?.text === 'local hello');
+    assert.equal(got.message.details.remoteMachine, undefined);
+    assert.ok(!String(got.message.content).includes('remote'), String(got.message.content));
+    let ambiguous;
+    try { await a.tool('send_pi_message', { target: 'stray-b', message: 'hi' }); assert.fail('expected ambiguous'); }
+    catch (error) { ambiguous = error; }
+    assert.match(ambiguous.message, /Ambiguous session/);
+    assert.ok(!ambiguous.message.includes('remote'), ambiguous.message);
+    assert.ok(!/[0-9a-f]{64}/.test(JSON.stringify(ambiguous.target)), JSON.stringify(ambiguous.target));
+  } finally {
+    await c.close();
+    await b.close();
+    await a.close();
+  }
+});
+
+test('gateway relay rejects a remote claim of another local session', { timeout: 30000 }, async () => {
+  const { component } = await import('./support/component.mjs');
+  const file = await writeSharedConfig(validConfig(PORT_REJ));
+  const flagOn = (_ctx, _bus, runtime) => runtime.flagValues.set('cross-session-remote', true);
+  const ga = await component('rej-a', { configure: flagOn });
+  const gb = await component('rej-b', { configure: flagOn });
+  try {
+    await until(async () => (await remoteList('127.0.0.1', PORT_REJ, PSK, 2000)).length === 2, 'gateway up');
+    // from.instanceId is another live LOCAL session: readPeer rejects the claim.
+    const spoof = JSON.parse(await rawFirstFrame(PORT_REJ, PSK, { v: 1, type: 'hello', requestId: 'b1c2d3e4', token: '', target: { id: gb.peer.id, instanceId: gb.peer.instanceId }, capabilities: ['cancel-safe-queue-v1'], from: { id: ga.peer.id, instanceId: ga.peer.instanceId, name: 'spoof', remote: true } }));
+    assert.equal(spoof.ok, false);
+    assert.equal(spoof.status, 'authentication_failed');
+  } finally {
+    await gb.close();
+    await ga.close();
+    await fs.promises.rm(file, { force: true });
+  }
+});
+
+test('flag off: real remote target not_found with no connection; remote hello to unix socket rejected', { timeout: 60000 }, async () => {
   const { component, wire } = await import('./support/component.mjs');
   const { randomUUID } = await import('node:crypto');
-  const file = await writeSharedConfig(validConfig(SEND_OFF));
+  // Real session behind a real gateway; the sender keeps the flag off.
+  // Counting TCP proxy in front of the gateway: a TLS handshake cannot start
+  // without a TCP connect, so zero connects proves no attempt was made.
+  const psk = randomBytes(32).toString('hex');
+  const B = spawnWorker('GO', PORT_REAL, [], psk);
+  let connects = 0;
+  const proxy = net.createServer(client => {
+    connects++;
+    const upstream = net.createConnection({ host: '127.0.0.1', port: PORT_REAL });
+    client.pipe(upstream); upstream.pipe(client);
+    client.on('error', () => upstream.destroy());
+    upstream.on('error', () => client.destroy());
+    client.on('close', () => upstream.destroy());
+    upstream.on('close', () => client.destroy());
+  });
+  await new Promise((resolve, reject) => { proxy.once('error', reject); proxy.listen({ host: '127.0.0.1', port: PORT_PXY }, resolve); });
+  const file = await writeSharedConfig({ listen: `127.0.0.1:${SEND_OFF}`, psk, peers: [`127.0.0.1:${PORT_PXY}`] });
+  const readyB = await B.wait('ready', 30000);
   const a = await component('off-sender');
   try {
     await expectRefused(SEND_OFF);
-    await assert.rejects(a.tool('send_pi_message', { target: '00'.repeat(16), message: 'hi' }), /not_found/);
-  } finally { await a.close(); await fs.promises.rm(file, { force: true }); }
+    await assert.rejects(a.tool('send_pi_message', { target: readyB.peer.instanceId, message: 'hi' }), /not_found/);
+    assert.equal(connects, 0);
+    // The counter is live: a real remote-list through the proxy connects once.
+    assert.equal((await remoteList('127.0.0.1', PORT_PXY, psk, 2000)).length, 1);
+    assert.equal(connects, 1);
+  } finally {
+    await a.close();
+    await fs.promises.rm(file, { force: true });
+    await new Promise(resolve => proxy.close(resolve));
+    await closeWorkers([B]);
+  }
   const off = await component('off-receiver2');
   try {
     const hello = { v: 1, type: 'hello', requestId: randomUUID(), token: off.peer.token, target: { id: off.peer.id, instanceId: off.peer.instanceId }, capabilities: ['cancel-safe-queue-v1'], from: { id: 'r', instanceId: randomBytes(16).toString('hex'), name: 'remote-guy', remote: true, machine: '127.0.0.1' } };

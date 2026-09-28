@@ -233,36 +233,39 @@ function isResponse(value: unknown): value is ResponseFrame {
 
 function isHello(value: unknown): value is HelloFrame {
   if (!value || typeof value !== "object") return false;
-  const frame = value as Partial<HelloFrame> & { from?: Record<string, unknown> };
-  if (
-    frame.v !== WIRE_VERSION ||
-    frame.type !== "hello" ||
-    !validCapabilities(frame.capabilities) ||
-    typeof frame.requestId !== "string" ||
-    !validId(frame.requestId) ||
-    typeof frame.token !== "string" ||
-    !frame.target ||
-    typeof frame.target.id !== "string" ||
-    frame.target.id.length === 0 || frame.target.id.length > 512 ||
-    typeof frame.target.instanceId !== "string" ||
-    !/^[0-9a-f]{32}$/.test(frame.target.instanceId)
-  ) return false;
-  if (frame.from === undefined) return true;
-  const from = frame.from as Record<string, unknown> | null;
-  if (!from || typeof from !== "object") return false;
-  if (typeof (from as HelloFromLocal).id !== "string" || ((from as HelloFromLocal).id as string).length === 0 || ((from as HelloFromLocal).id as string).length > 512) return false;
-  if (typeof from.instanceId !== "string" || !/^[0-9a-f]{32}$/.test(from.instanceId)) return false;
-  if ((from as HelloFromRemote).remote === true) {
-    if ((from as Record<string, unknown>).token !== undefined) return false;
-    const name = (from as HelloFromRemote).name;
-    if (typeof name !== "string" || name.length === 0 || name.length > 512 || codePointLength(name) > 200) return false;
-    const machine = (from as HelloFromRemote).machine;
-    if (machine !== undefined && (typeof machine !== "string" || machine.length === 0 || machine.length > 64)) return false;
-    return true;
-  }
-  if (typeof (from as HelloFromLocal).token !== "string") return false;
-  if ((from as Record<string, unknown>).remote !== undefined || (from as Record<string, unknown>).name !== undefined || (from as Record<string, unknown>).machine !== undefined) return false;
-  return true;
+  const frame = value as Partial<HelloFrame>;
+  const from = frame.from as Partial<HelloFromLocal & HelloFromRemote & { token?: unknown }> | undefined;
+  return (
+    frame.v === WIRE_VERSION &&
+    frame.type === "hello" &&
+    validCapabilities(frame.capabilities) &&
+    typeof frame.requestId === "string" &&
+    validId(frame.requestId) &&
+    typeof frame.token === "string" &&
+    !!frame.target &&
+    typeof frame.target.id === "string" &&
+    frame.target.id.length > 0 && frame.target.id.length <= 512 &&
+    typeof frame.target.instanceId === "string" &&
+    /^[0-9a-f]{32}$/.test(frame.target.instanceId) &&
+    (
+      from === undefined ||
+      (
+        !!from && typeof from.id === "string" &&
+        from.id.length > 0 && from.id.length <= 512 &&
+        typeof from.instanceId === "string" &&
+        /^[0-9a-f]{32}$/.test(from.instanceId) &&
+        (
+          from.remote === true
+            ? from.token === undefined &&
+              typeof from.name === "string" &&
+              from.name.length > 0 && from.name.length <= 512 && codePointLength(from.name) <= 200 &&
+              (from.machine === undefined ||
+                (typeof from.machine === "string" && from.machine.length > 0 && from.machine.length <= 64))
+            : typeof from.token === "string"
+        )
+      )
+    )
+  );
 }
 
 function isMessage(value: unknown): value is MessageFrame {
@@ -369,12 +372,13 @@ async function vetSocket(peer: Peer) {
 async function exchange(peer: Peer | RemotePeer, from: Peer | undefined, message: MessageFrame | undefined, timeoutMs: number, signal?: AbortSignal, remoteConfig?: RemoteConfig): Promise<ResponseFrame> {
   const expiresAt = performance.now() + timeoutMs;
   const helloRequestId = randomUUID();
-  const isRemote = typeof (peer as Peer).socketPath !== "string";
+  // Remote-ness comes only from the caller's explicit match source: send()
+  // passes remoteConfig solely for a remote match. Never sniff the peer
+  // object, since a stray machine key in a local registration must stay local.
+  const isRemote = remoteConfig !== undefined;
   let remoteEndpoint: { host: string; port: number } | undefined;
   let remoteKey: Buffer | undefined;
-  let hello: HelloFrame;
-  if (isRemote) {
-    if (!remoteConfig) throw new DeliveryError("not_found", "Remote messaging is not configured");
+  if (remoteConfig !== undefined) {
     const machine = (peer as RemotePeer).machine;
     const endpoint = parseHostPort(machine);
     if (!endpoint) throw new DeliveryError("not_found", `Remote peer machine is not a valid endpoint: ${machine}`);
@@ -383,26 +387,18 @@ async function exchange(peer: Peer | RemotePeer, from: Peer | undefined, message
     }
     remoteEndpoint = endpoint;
     remoteKey = Buffer.from(remoteConfig.psk, "hex");
-    hello = {
-      v: WIRE_VERSION,
-      type: "hello",
-      capabilities: [CAPABILITY, GOAL_CAPABILITY],
-      requestId: helloRequestId,
-      token: "",
-      target: { id: peer.id, instanceId: peer.instanceId },
-      ...(from && { from: { id: from.id, instanceId: from.instanceId, name: cleanName(from.name), remote: true } as HelloFromRemote }),
-    };
-  } else {
-    hello = {
-      v: WIRE_VERSION,
-      type: "hello",
-      capabilities: [CAPABILITY, GOAL_CAPABILITY],
-      requestId: helloRequestId,
-      token: (peer as Peer).token,
-      target: { id: peer.id, instanceId: peer.instanceId },
-      ...(from && { from: { id: from.id, instanceId: from.instanceId, token: from.token } }),
-    };
   }
+  const hello: HelloFrame = {
+    v: WIRE_VERSION,
+    type: "hello",
+    capabilities: [CAPABILITY, GOAL_CAPABILITY],
+    requestId: helloRequestId,
+    token: isRemote ? "" : (peer as Peer).token,
+    target: { id: peer.id, instanceId: peer.instanceId },
+    ...(from && (isRemote
+      ? { from: { id: from.id, instanceId: from.instanceId, name: cleanName(from.name), remote: true } as HelloFromRemote }
+      : { from: { id: from.id, instanceId: from.instanceId, token: from.token } })),
+  };
   const helloLine = encodeFrame(hello);
   const messageLine = message ? encodeFrame(message) : undefined;
 
@@ -476,14 +472,11 @@ async function exchange(peer: Peer | RemotePeer, from: Peer | undefined, message
       });
     };
     if (isRemote) {
-      const endpoint = remoteEndpoint;
-      const key = remoteKey;
-      if (!endpoint || !key) { fail(new DeliveryError("not_found", "Remote endpoint is not configured")); return; }
       socket = tlsConnect({
         ...remoteClientOptions(),
-        host: endpoint.host,
-        port: endpoint.port,
-        pskCallback: () => ({ identity: REMOTE_PSK_IDENTITY, psk: key }),
+        host: remoteEndpoint!.host,
+        port: remoteEndpoint!.port,
+        pskCallback: () => ({ identity: REMOTE_PSK_IDENTITY, psk: remoteKey! }),
       });
       socket.on("secureConnect", () => { if (performance.now() >= expiresAt) timeout(); else if (!settled) socket!.write(helloLine); });
       attach();
@@ -667,8 +660,7 @@ export default function (pi: ExtensionAPI) {
         reply({ ok: false, code: "invalid_request", state: "refused", retryable: false, next: "Query current local info and use exact local/remote incarnation, valid messageId/text" }); return;
       }
       void send(value.remoteInstanceId, value.text, value.summary, value.messageId, controller.signal).then(result => {
-        const target = (result.peer as Partial<RemotePeer>).machine ? result.peer : publicPeer(result.peer as Peer);
-        reply({ ok: true, messageId: result.messageId, target, receipt: result.receipt });
+        reply({ ok: true, messageId: result.messageId, target: result.target, receipt: result.receipt });
       }, error => {
         const e = error instanceof DeliveryError ? error : new DeliveryError("send_failed", String(error));
         reply({ ok: false, code: e.code, state: e.state, retryable: e.retryable, next: e.next, error: e.message });
@@ -1037,7 +1029,7 @@ export default function (pi: ExtensionAPI) {
     const incarnation = current?.instanceId;
     remoteClients.add(socket);
     let localSocket: Socket | undefined;
-    const replyTimer = setTimeout(() => { try { socket.destroy(); } catch { /* best effort */ } try { localSocket?.destroy(); } catch { /* best effort */ } }, FIRST_LINE_TIMEOUT_MS);
+    const replyTimer = setTimeout(() => { socket.destroy(); localSocket?.destroy(); }, FIRST_LINE_TIMEOUT_MS);
     replyTimer.unref();
     let finished = false;
     const done = (frame: object) => {
@@ -1052,28 +1044,22 @@ export default function (pi: ExtensionAPI) {
       clearTimeout(replyTimer);
       socket.destroy();
     };
-    socket.on("error", () => { try { localSocket?.destroy(); } catch { /* best effort */ } });
-    socket.on("close", () => { clearTimeout(replyTimer); remoteClients.delete(socket); try { localSocket?.destroy(); } catch { /* best effort */ } });
+    socket.on("error", () => { localSocket?.destroy(); });
+    socket.on("close", () => { clearTimeout(replyTimer); remoteClients.delete(socket); localSocket?.destroy(); });
     const relayHello = async (clientHello: HelloFrame) => {
       if (finished || shuttingDown || current?.instanceId !== incarnation) return;
-      let recipient: Peer | undefined;
-      if (clientHello.target.instanceId === current?.instanceId) {
-        if (!current || clientHello.target.id !== current.id) {
-          done({ v: WIRE_VERSION, type: "response", requestId: clientHello.requestId, ok: false, status: "not_found", error: "Unknown target session" });
-          return;
-        }
-        recipient = current;
-      } else {
-        const found = await readPeer(clientHello.target.instanceId);
-        if (finished || shuttingDown || current?.instanceId !== incarnation) return;
-        if (!found || found.id !== clientHello.target.id) {
-          done({ v: WIRE_VERSION, type: "response", requestId: clientHello.requestId, ok: false, status: "not_found", error: "Unknown target session" });
-          return;
-        }
-        recipient = found;
+      // isHello already bounds target/from: only split the local lookup from
+      // the single not_found reply, and require the remote from marker.
+      const recipient = clientHello.target.instanceId === current?.instanceId
+        ? current
+        : await readPeer(clientHello.target.instanceId);
+      if (finished || shuttingDown || current?.instanceId !== incarnation) return;
+      if (!recipient || recipient.id !== clientHello.target.id) {
+        done({ v: WIRE_VERSION, type: "response", requestId: clientHello.requestId, ok: false, status: "not_found", error: "Unknown target session" });
+        return;
       }
       const from = clientHello.from as HelloFromRemote | undefined;
-      if (!from || from.remote !== true || typeof from.id !== "string" || typeof from.instanceId !== "string" || typeof from.name !== "string") {
+      if (!from || from.remote !== true) {
         done({ v: WIRE_VERSION, type: "response", requestId: clientHello.requestId, ok: false, status: "authentication_failed", error: "Remote hello requires from.remote true" });
         return;
       }
@@ -1084,11 +1070,11 @@ export default function (pi: ExtensionAPI) {
         requestId: clientHello.requestId,
         capabilities: clientHello.capabilities,
         target: clientHello.target,
-        token: (recipient as Peer).token,
+        token: recipient.token,
         from: { id: from.id, instanceId: from.instanceId, name: from.name, remote: true, machine },
       };
       try {
-        await vetSocket(recipient as Peer);
+        await vetSocket(recipient);
       } catch (error) {
         done({ v: WIRE_VERSION, type: "response", requestId: clientHello.requestId, ok: false, status: "transient", error: error instanceof Error ? error.message : String(error) });
         return;
@@ -1096,30 +1082,30 @@ export default function (pi: ExtensionAPI) {
       if (finished || shuttingDown || current?.instanceId !== incarnation || socket.destroyed) return;
       let local: Socket;
       try {
-        local = createConnection({ path: (recipient as Peer).socketPath });
+        local = createConnection({ path: recipient.socketPath });
         await new Promise<void>((resolve, reject) => {
           local.once("connect", () => resolve());
           local.once("error", reject);
         });
       } catch (error) {
-        try { (local! as Socket)?.destroy(); } catch { /* best effort */ }
+        (local! as Socket)?.destroy();
         done({ v: WIRE_VERSION, type: "response", requestId: clientHello.requestId, ok: false, status: "transient", error: error instanceof Error ? error.message : String(error) });
         return;
       }
-      if (finished || shuttingDown || socket.destroyed || local!.destroyed) { try { local!.destroy(); } catch { /* best effort */ } return; }
+      if (finished || shuttingDown || socket.destroyed || local!.destroyed) { local!.destroy(); return; }
       localSocket = local!;
       try {
         localSocket.write(`${JSON.stringify(rewritten)}\n`);
       } catch (error) {
         const failing = localSocket; localSocket = undefined;
-        try { failing.destroy(); } catch { /* best effort */ }
+        failing?.destroy();
         done({ v: WIRE_VERSION, type: "response", requestId: clientHello.requestId, ok: false, status: "transient", error: error instanceof Error ? error.message : String(error) });
         return;
       }
       socket.pipe(localSocket);
       localSocket.pipe(socket);
-      localSocket.once("close", () => { try { socket.destroy(); } catch { /* best effort */ } });
-      localSocket.once("error", () => { try { socket.destroy(); } catch { /* best effort */ } });
+      localSocket.once("close", () => { socket.destroy(); });
+      localSocket.once("error", () => { socket.destroy(); });
     };
     socket.on("data", frameReader(line => {
       if (finished) return false;
@@ -1175,15 +1161,19 @@ export default function (pi: ExtensionAPI) {
     return { peers: settled.flatMap(row => row.peers), diagnostics: settled.map(row => row.diagnostic).filter((line): line is string => !!line) };
   }
 
+  // A machine reachable via two IPs (e.g. LAN + ZeroTier) must not list
+  // its own sessions as remote: drop anything already known locally.
+  function excludeLocalSessions(remotePeers: RemotePeer[], localPeers: Peer[]): RemotePeer[] {
+    const localIds = new Set([current?.instanceId, ...localPeers.map(peer => peer.instanceId)]);
+    return remotePeers.filter(peer => !localIds.has(peer.instanceId));
+  }
+
   async function fullListing() {
     const peers = await livePeers();
     const listing = await peersListing(peers);
     if (!remoteEnabled() || !remoteConfig) return listing;
     const remote = await queryRemotePeers();
-    // A machine reachable via two IPs (e.g. LAN + ZeroTier) must not list
-    // its own sessions as remote: drop anything already known locally.
-    const localIds = new Set([current?.instanceId, ...peers.map(peer => peer.instanceId)]);
-    const fresh = remote.peers.filter(peer => !localIds.has(peer.instanceId));
+    const fresh = excludeLocalSessions(remote.peers, peers);
     return { self: listing.self, peers: [...listing.peers, ...fresh], remoteDiagnostics: remote.diagnostics };
   }
 
@@ -1221,9 +1211,7 @@ export default function (pi: ExtensionAPI) {
     const peers = await livePeers();
     let remotePeers: RemotePeer[] = [];
     if (remoteEnabled() && remoteConfig) {
-      const remote = await queryRemotePeers();
-      const localIds = new Set([current?.instanceId, ...peers.map(peer => peer.instanceId)]);
-      remotePeers = remote.peers.filter(peer => !localIds.has(peer.instanceId));
+      remotePeers = excludeLocalSessions((await queryRemotePeers()).peers, peers);
     }
     const trimmed = target.trim().replace(/^@/, "");
     const namedRef = /^(.*\S)\s+\[([0-9a-f]{6,32})\]$/.exec(trimmed);
@@ -1238,10 +1226,17 @@ export default function (pi: ExtensionAPI) {
     const remoteMatches = remotePeers.filter(matchPeer);
     const allMatches: (Peer | RemotePeer)[] = [...localMatches, ...remoteMatches];
     if (allMatches.length === 0) throw new DeliveryError("not_found", `No live Pi session named or identified by: ${target}`);
-    if (allMatches.length > 1) throw new DeliveryError("ambiguous", `Ambiguous session; use name [ref]: ${allMatches.map(peer => displayPeer(peer, (peer as Partial<RemotePeer>).machine)).join(" | ")}`);
+    if (allMatches.length > 1) throw new DeliveryError("ambiguous", `Ambiguous session; use name [ref]: ${allMatches.map(peer => displayPeer(peer, remoteMatches.includes(peer as RemotePeer) ? (peer as RemotePeer).machine : undefined)).join(" | ")}`);
 
     if (shuttingDown || current?.instanceId !== incarnation || sendingSignal.aborted) throw new DeliveryError("not_ready", "Local incarnation changed/cancelled before send");
     const peer: Peer | RemotePeer = allMatches[0] as Peer | RemotePeer;
+    // Remote-ness is where the match came from, never a key on the peer
+    // object: readPeer passes unknown registration keys through, so a local
+    // registration with a stray machine key must still send (and render) as local.
+    const remote = remoteMatches.includes(peer as RemotePeer) ? (peer as RemotePeer) : undefined;
+    const targetOut = remote
+      ? { id: remote.id, instanceId: remote.instanceId, name: remote.name, status: remote.status, cwd: remote.cwd, ref: remote.ref, machine: remote.machine }
+      : publicPeer(peer as Peer);
     const goalSendKey = `${peer.instanceId}:${goalId}`;
     if (budget <= 0 && (!goalId || !confirmedGoalSends.has(goalSendKey))) throw new DeliveryError("budget_exhausted", "No budget to attempt an unconfirmed exchange; only previously confirmed goal traffic can continue");
     const frame: MessageFrame = {
@@ -1258,17 +1253,17 @@ export default function (pi: ExtensionAPI) {
     if (charged) budget--; // Reserve synchronously; even rejected/unknown scoped attempts cost budget.
     else confirmedGoalSends.delete(goalSendKey); // One free in-flight attempt per prior confirmation, no concurrent fan-out.
     try {
-      const receipt = await exchange(peer, current, frame, SEND_TIMEOUT_MS, sendingSignal, remoteConfig);
+      const receipt = await exchange(peer, current, frame, SEND_TIMEOUT_MS, sendingSignal, remote && remoteConfig);
       if (goalId && ["submitted", "queued"].includes(receipt.status) && current?.instanceId === incarnation && !shuttingDown) {
         if (charged) budget++;
         confirmedGoalSends.add(goalSendKey);
         while (confirmedGoalSends.size > 64) confirmedGoalSends.delete(confirmedGoalSends.values().next().value!);
       }
-      return { peer, receipt, messageId: frame.messageId };
+      return { peer, target: targetOut, receipt, messageId: frame.messageId };
     } catch (error) {
       confirmedGoalSends.delete(goalSendKey);
       const e = error instanceof DeliveryError ? error : new DeliveryError("transport_error", String(error));
-      Object.assign(e, { messageId: frame.messageId, target: (peer as Partial<RemotePeer>).machine ? peer : publicPeer(peer as Peer) });
+      Object.assign(e, { messageId: frame.messageId, target: targetOut });
       e.message += `; messageId=${frame.messageId}; recipient=${peer.instanceId}; state=${e.state}; retryable=${e.retryable}; next=${e.next}`;
       throw e;
     }
@@ -1341,8 +1336,7 @@ export default function (pi: ExtensionAPI) {
       goalId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Receiver-issued active goal ID; receiver must have bound this exact sender runtime. Never inferred from message text." })),
     }),
     async execute(_toolCallId, params) {
-      const { peer, receipt, messageId } = await send(params.target, params.message, params.summary, undefined, undefined, params.goalId);
-      const target = (peer as Partial<RemotePeer>).machine ? peer : publicPeer(peer as Peer);
+      const { peer, target, receipt, messageId } = await send(params.target, params.message, params.summary, undefined, undefined, params.goalId);
       return {
         content: [{ type: "text", text: `Message ${receipt.status} to ${cleanName(peer.name)} [${short(peer.instanceId)}]; Pi's extension API does not provide a durable delivery acknowledgement` }],
         details: { status: receipt.status, messageId, target },
