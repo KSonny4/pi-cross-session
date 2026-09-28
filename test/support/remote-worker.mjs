@@ -24,6 +24,28 @@ process.on('message', async command => {
         type: 'listed', text: result.content[0].text,
         details: { peers: result.details.peers, remoteDiagnostics: result.details.remoteDiagnostics ?? [] },
       });
+    } else if (command.type === 'send') {
+      try {
+        const result = await tool(x, 'send_pi_message').execute('fixture-send', {
+          target: command.target,
+          message: command.message,
+          ...(command.goalId ? { goalId: command.goalId } : {}),
+        });
+        process.send({ type: 'sent', id: command.id, status: result.details.status, messageId: result.details.messageId, text: result.content[0].text });
+      } catch (error) {
+        process.send({ type: 'sendFailed', id: command.id, error: String(error?.message ?? error), code: error?.code ?? '' });
+      }
+    } else if (command.type === 'received') {
+      const messages = x.session.agent.state.messages
+        .filter(m => m.role === 'custom' && m.customType === 'cross-session')
+        .map(m => ({
+          text: m.details?.text,
+          content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+          from: m.details?.from,
+          remoteMachine: m.details?.remoteMachine,
+          messageId: m.details?.messageId,
+        }));
+      process.send({ type: 'received', id: command.id, messages });
     } else if (command.type === 'close') {
       await x.close(); process.disconnect();
     }
