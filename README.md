@@ -36,6 +36,7 @@ Each independent Host session registers itself and listens on a private IPC endp
 | `/cross-session-status` | command | Bounded local queue/submission/drop diagnostics and remaining budget |
 | `/cross-session-resume` | command | Explicit local-user reopening after observed cancellation; never replays dropped messages or refills budget |
 | `--cross-session-rpc` | flag | Enable trusted Host-only EventBus send/info/received contracts (default **off**) |
+| `--cross-session-remote` | flag | List live Pi sessions on LAN/ZeroTier peer gateways over TLS-PSK (default **off**; slice 1: list only, remote sessions are not sendable yet) |
 
 Just talk to Pi: *"tell the backend session the order API moved to /v2"* — the model calls `send_pi_message` itself. If the target is not explicit, the model uses `list_pi` and chooses from the known responsibility, exact session name, and working directory; busy/idle is delivery state, not a routing preference. In the TUI, type `@` to select a live session as `@name [ref]` and make the target explicit.
 
@@ -72,6 +73,24 @@ The Host must tell the worker the returned goal ID and its own runtime ID using 
 - Both peers must support negotiated `goal-scoped-peer-v1`; a scoped send never silently falls back to unscoped delivery. Receiver-confirmed goal-scoped sends/admissions do not spend the legacy 256-message lifetime budget, so successful long-running goals do not stop at a hidden round quota. Outbound attempts reserve budget until an authenticated `submitted`/`queued` receipt refunds it; rejected/unknown attempts stay charged. At zero budget only one in-flight send per previously confirmed receiver/goal can proceed, with at most 64 confirmation keys retained. A failed send removes that confirmation, and an unconfirmed/new goal cannot bypass exhausted budget. Forged goal IDs also consume the receiver's rate tokens. Frame, rate, queue and TTL bounds still apply. Receipts and dedup caches retain at most 512 recent entries (queued/current entries are protected from receipt eviction); old status queries may return `unknown`. No automatic retry.
 
 This is structured task delegation, not a semantic verifier or a Bash sandbox: the Host must still keep task content inside the objective and honor destructive/security confirmations. Do not classify every message from a named peer as authorized, infer membership from text, or bypass a blocked call using another tool.
+
+### Remote peers (LAN / ZeroTier)
+
+With `--cross-session-remote`, sessions on **different machines** that share an IP network appear in `list_pi`/`/peers` with a `remote <ip:port>` marker and a `machine` field. Any IP network works — ZeroTier is just a virtual LAN, nothing here is ZeroTier-specific. Sending to remote sessions lands in a follow-up slice; remote entries are not sendable yet.
+
+Each machine uses the same `<agentDir>/cross-session-remote.json` file (alongside `peers/`), mode `0600`:
+
+```json
+{
+  "listen": "10.147.17.5:7717",
+  "psk": "<64 lowercase hex>",
+  "peers": ["10.147.17.9:7717", "192.168.0.91:7717"]
+}
+```
+
+Generate the key with `openssl rand -hex 32` and copy the file to every machine. `listen` and `peers` are IP literals only (IPv6 as `[addr]:port`); the gateway binds exactly `listen`, never `0.0.0.0`/`::`. The first flagged session to bind `listen` becomes that machine's gateway (the rest retry on the 30 s heartbeat); the gateway serves only `remote-list` over TLS 1.2 with the pre-shared key — mutual auth plus encryption, no certificates, no extra dependencies.
+
+Security boundary: anyone holding the PSK is trusted like the same OS user is today. A PSK holder can claim any remote session identity, but never a local one. The PSK file is a secret, like the registration tokens.
 
 ## How it works
 
