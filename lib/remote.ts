@@ -51,7 +51,7 @@ export function parseHostPort(value: unknown): RemoteEndpoint | null {
   }
   const family = isIP(host);
   if (family !== 4 && family !== 6) return null;
-  if (/^(::ffff:)?[0:.]+$/i.test(host)) return null;
+  if (host.includes("%") || /^[0:]*(ffff:)?[0:.]+$/i.test(host)) return null;
   const port = Number(portText);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
   return { host, port };

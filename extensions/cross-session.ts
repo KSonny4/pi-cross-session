@@ -933,6 +933,12 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (shuttingDown || !current) { gateway.close(); return; }
+      const bound = (gateway.address() as { address?: string } | null)?.address;
+      if (bound === "::" || bound === "0.0.0.0") {
+        gateway.close();
+        notifyRemote(`refusing gateway bound to all interfaces (${bound}); set listen to a specific IP`);
+        return;
+      }
       remoteServer = gateway;
       gateway.on("error", (error) => { try { currentCtx?.ui.notify(`Cross-session remote inbox error: ${error.message}`, "error"); } catch { /* best effort */ } });
       gateway.unref();
@@ -997,7 +1003,7 @@ export default function (pi: ExtensionAPI) {
     }, fail));
   }
 
-  // Parallel PROBE-scale queries; per-gateway failures are diagnostics, never throw.
+  // Parallel queries bounded by REMOTE_LIST_TIMEOUT_MS; per-gateway failures are diagnostics, never throw.
   async function queryRemotePeers(): Promise<{ peers: RemotePeer[]; diagnostics: string[] }> {
     if (!remoteEnabled() || !remoteConfig || shuttingDown) return { peers: [], diagnostics: [] };
     const config = remoteConfig;

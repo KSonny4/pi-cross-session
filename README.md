@@ -78,7 +78,7 @@ This is structured task delegation, not a semantic verifier or a Bash sandbox: t
 
 With `--cross-session-remote`, sessions on **different machines** that share an IP network appear in `list_pi`/`/peers` with a `remote <ip:port>` marker and a `machine` field. Any IP network works — ZeroTier is just a virtual LAN, nothing here is ZeroTier-specific. Sending to remote sessions lands in a follow-up slice; remote entries are not sendable yet.
 
-Each machine uses the same `<agentDir>/cross-session-remote.json` file (alongside `peers/`), mode `0600`:
+Each machine has its own `<agentDir>/cross-session-remote.json` (alongside `peers/`), mode `0600`:
 
 ```json
 {
