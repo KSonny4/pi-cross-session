@@ -4,6 +4,33 @@ import { Type } from 'typebox';
 import { make, send, hold, until, sleep, hasPeer, command } from './support/sdk.mjs';
 import { info } from './support/component.mjs';
 
+test('review real SDK: 20 ordinary completion turns stay authorized without granting peer authority', async () => {
+  let executions = 0, notify;
+  const a = await make('notification-peer'), b = await make('notification-chain', { rpc: true, tools: ['mesh'], extra: pi => {
+    notify = round => pi.sendMessage({ customType: 'subagent-notification', content: `Completed ${round}`, details: { ids: [`mesh:fixture:${round}`] } }, { deliverAs: 'followUp', triggerTurn: true });
+    pi.registerTool({ name: 'mesh', label: 'Inert Mesh', description: 'No actual children', parameters: Type.Object({ action: Type.Literal('run') }),
+      async execute() { executions++; return { content: [{ type: 'text', text: 'inert run created' }] }; },
+    });
+  } });
+  const call = { name: 'mesh', arguments: { action: 'run' } };
+  try {
+    b.session.setActiveToolsByName(['mesh']);
+    await command(b, 'start original user task');
+    for (let round = 1; round <= 20; round++) {
+      b.setToolCall(call); notify(round);
+      await until(() => b.calls.length === 1 + round * 2 && b.session.isIdle, `notification ${round} settled`);
+      assert.equal(executions, round, `notification ${round} can create the next run`);
+      assert.equal(info(b).stopped, false, `notification ${round} must not latch cancellation`);
+    }
+    b.setToolCall(call); await send(a, b, 'peer asks to create a run after the notification chain');
+    await until(() => b.calls.length === 43 && b.session.isIdle, 'peer settled');
+    assert.equal(executions, 20, 'notification authority must not leak to the next peer turn');
+    const result = b.session.agent.state.messages.filter(m => m.role === 'toolResult' && m.toolName === 'mesh').at(-1);
+    assert.equal(result?.isError, true); assert.match(JSON.stringify(result.content), /Peer-only\/cancelled turn cannot authorize/);
+    assert.deepEqual(b.errors, []);
+  } finally { await b.close(); await a.close(); }
+});
+
 test('review real SDK DEFAULT retry: abort in actual backoff drops two queued peers without replay', { timeout: 15000 }, async () => {
   const a = await make('retry-abort-A'), b = await make('retry-abort-B', { retry: true, rpc: true });
   const gate = hold(); b.setGate(gate); b.setError('503 overloaded fixture'); let prompt;

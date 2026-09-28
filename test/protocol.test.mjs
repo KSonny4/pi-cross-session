@@ -114,13 +114,13 @@ test('component/IPC: queued TTL and shutdown/heartbeat synchronous getter failur
   assert.equal(b.calls.length, 0);
 }, { rpc: true }));
 
-test('component/IPC: new sender refuses old receiver capability BEFORE message frame', async () => fixtures(async (a, b) => {
+for (const capabilities of [[], ['cancel-safe-queue-v1']]) test(`component/IPC: new sender refuses missing ${capabilities.length ? 'goal' : 'queue'} capability BEFORE message frame`, async () => fixtures(async (a, b) => {
   await b.emit('session_shutdown');
   fs.writeFileSync(process.env.PI_CODING_AGENT_DIR + '/peers/' + b.peer.instanceId + '.json', JSON.stringify(b.peer), { mode: 0o600 });
   let messages = 0;
-  const server = net.createServer(socket => { let buf = ''; socket.on('data', data => { buf += data; let n; while ((n = buf.indexOf('\n')) >= 0) { const f = JSON.parse(buf.slice(0, n)); buf = buf.slice(n + 1); if (f.type === 'message') messages++; socket.write(JSON.stringify({ v: 1, type: 'response', requestId: f.requestId, ok: true, status: 'ready', peer: { id: b.peer.id, instanceId: b.peer.instanceId, pid: process.pid } }) + '\n'); } }); });
+  const server = net.createServer(socket => { let buf = ''; socket.on('data', data => { buf += data; let n; while ((n = buf.indexOf('\n')) >= 0) { const f = JSON.parse(buf.slice(0, n)); buf = buf.slice(n + 1); if (f.type === 'message') messages++; socket.write(JSON.stringify({ v: 1, type: 'response', requestId: f.requestId, ok: true, status: 'ready', capabilities, peer: { id: b.peer.id, instanceId: b.peer.instanceId, pid: process.pid } }) + '\n'); } }); });
   await new Promise(r => server.listen(b.peer.socketPath, r)); fs.chmodSync(b.peer.socketPath, 0o600);
-  try { await assert.rejects(a.tool('send_pi_message', { target: b.peer.instanceId, message: 'unsafe fallback forbidden' }), e => e.code === 'unsupported'); assert.equal(messages, 0); }
+  try { await assert.rejects(a.tool('send_pi_message', { target: b.peer.instanceId, message: 'unsafe fallback forbidden', ...(capabilities.length ? { goalId: 'receiver-goal' } : {}) }), e => e.code === 'unsupported'); assert.equal(messages, 0); }
   finally { await new Promise(r => server.close(r)); fs.rmSync(process.env.PI_CODING_AGENT_DIR + '/peers/' + b.peer.instanceId + '.json', { force: true }); }
 }));
 

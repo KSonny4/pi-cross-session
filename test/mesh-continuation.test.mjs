@@ -34,6 +34,26 @@ test('Mesh completion: grant claims only its exact continue once; trusted notifi
   } finally { await x.close(); }
 });
 
+for (const outcome of ['abort', 'error', 'unobserved']) test(`Ordinary notifications preserve the ${outcome} fence`, async () => {
+  const x = await component('notification-fence-' + outcome);
+  try {
+    await x.busy(); await x.settled();
+    await auto(x, {});
+    assert.equal(await gate(x, { action: 'run' }), undefined);
+    if (outcome === 'abort') x.controller.abort();
+    if (outcome === 'error') await x.emit('message_end', { message: { role: 'assistant', stopReason: 'error' } });
+    await x.settled(false);
+    for (let round = 0; round < 3; round++) {
+      await auto(x, {});
+      assert.equal((await gate(x, { action: 'run' }))?.block, true, `notification ${round} must preserve the fence`);
+      await x.settled();
+    }
+    await x.busy();
+    assert.equal(await gate(x, { action: 'run' }), undefined, 'only fresh local user input restores authority');
+    await x.settled();
+  } finally { await x.close(); }
+});
+
 test('adaptive phases are unbounded by default; optional maxRuns caps stages', async () => {
   const x = await component('continuation-adaptive');
   const original = { action: 'run', tasks: [{ agent: 'worker', task: 'original goal' }], autoContinuation: {} };

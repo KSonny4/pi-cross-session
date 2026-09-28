@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { repo, createEventBus, registrations, sleep, until } from './sdk.mjs';
 const { loadExtensions } = await import(repo + '/node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js');
 export async function component(name, options = {}) {
-  const bus = createEventBus(), calls = [], notices = [];
+  const bus = createEventBus(), calls = [], notices = [], entries = [];
   if (options.managed) bus.on('pi-mesh:runtime:identity:query', q => q.reply(Object.freeze({ version: 1, managed: true, agentId: name })));
   const { extensions, runtime, errors } = await loadExtensions([repo + '/extensions/cross-session.ts'], process.env.PI_CROSS_TEST_PRIVATE_ROOT, bus);
   assert.deepEqual(errors, []); const ext = extensions[0];
@@ -14,7 +14,8 @@ export async function component(name, options = {}) {
   runtime.flagValues.set('cross-session-inbound', options.inbound ?? 'accept');
   runtime.getSessionName = () => name;
   runtime.sendMessage = (message, opts) => { calls.push({ message, opts }); };
-  const ctx = { cwd: process.env.PI_CROSS_TEST_PRIVATE_ROOT, mode: 'rpc', signal: undefined, isIdle: () => idle, sessionManager: { getSessionId: () => sessionId }, ui: { notify: (...args) => notices.push(args) } };
+  runtime.appendEntry = (customType, data) => entries.push({ type: 'custom', customType, data, id: randomUUID(), parentId: null, timestamp: new Date().toISOString() });
+  const ctx = { cwd: process.env.PI_CROSS_TEST_PRIVATE_ROOT, mode: 'rpc', signal: undefined, isIdle: () => idle, sessionManager: { getSessionId: () => sessionId, getEntries: () => entries }, ui: { notify: (...args) => notices.push(args) } };
   let idle = true, sessionId = randomUUID();
   async function emit(type, value = {}) { let result; for (const h of ext.handlers.get(type) ?? []) result = await h({ type, ...value }, ctx); return result; }
   options.configure?.(ctx, bus, runtime);
