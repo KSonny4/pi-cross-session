@@ -1009,9 +1009,12 @@ export default function (pi: ExtensionAPI) {
         try {
           const peers = await livePeers();
           if (finished || shuttingDown || current?.instanceId !== incarnation) return;
+          // The gateway lists every live local session including itself:
+          // single-session machines would otherwise be invisible remotely.
+          const local = current ? [current, ...peers] : peers;
           done({
             v: WIRE_VERSION, type: "response", requestId, ok: true, status: "listed",
-            peers: peers.map(peer => ({
+            peers: local.map(peer => ({
               id: peer.id, instanceId: peer.instanceId, name: peer.name,
               status: peer.status, cwd: peer.cwd, ref: short(peer.instanceId),
             })),
