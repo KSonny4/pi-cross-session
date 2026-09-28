@@ -13,6 +13,7 @@ import { repo, until } from './support/sdk.mjs';
 
 const PSK = 'ab'.repeat(32);
 const PORT_A = 17771, PORT_B = 17772, PORT_C = 17773, PORT_GW = 17778, PORT_OFF = 17779;
+const SEND_A = 17781, SEND_B = 17782, SEND_OFF = 17784;
 
 function validConfig(port = PORT_GW, psk = PSK, peers = []) {
   return { listen: `127.0.0.1:${port}`, psk, peers };
@@ -222,4 +223,101 @@ test('two machines: matching psk lists remote sessions with machine; wrong psk i
       try { fs.rmdirSync(`/tmp/pi-peers-${process.getuid()}-${createHash('sha256').update(agentDir).digest('hex').slice(0, 12)}`); } catch { /* best effort */ }
     }
   }
+});
+
+async function closeWorkers(workers) {
+  for (const x of workers) {
+    if (x.child.exitCode === null) {
+      x.child.send({ type: 'close' });
+      await Promise.race([x.exited, until(() => x.child.exitCode !== null, 'worker exit', 10000)]);
+    }
+    if (x.child.exitCode === null) { x.child.kill('SIGKILL'); await x.exited; }
+    const agentDir = path.join(process.env.PI_CROSS_TEST_PRIVATE_ROOT, `remote-${x.name}-${x.child.pid}`);
+    try { fs.rmdirSync(`/tmp/pi-peers-${process.getuid()}-${createHash('sha256').update(agentDir).digest('hex').slice(0, 12)}`); } catch { /* best effort */ }
+  }
+}
+
+async function remoteSend(worker, target, message, goalId) {
+  const id = `${Date.now()}-${Math.random()}`;
+  worker.child.send({ type: 'send', id, target, message, ...(goalId ? { goalId } : {}) });
+  await until(() => worker.messages.some(m => (m.type === 'sent' || m.type === 'sendFailed') && m.id === id), 'send result', 15000);
+  const result = worker.messages.find(m => (m.type === 'sent' || m.type === 'sendFailed') && m.id === id);
+  assert.ok(result);
+  return result;
+}
+
+async function pollReceived(worker, predicate, ms = 15000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    const id = `poll-${Date.now()}-${Math.random()}`;
+    worker.child.send({ type: 'received', id });
+    await until(() => worker.messages.some(m => m.type === 'received' && m.id === id), 'received poll', 5000);
+    const reply = worker.messages.find(m => m.type === 'received' && m.id === id);
+    if (reply && predicate(reply.messages)) return reply;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  throw new Error('TIMEOUT waiting for remote delivery');
+}
+
+test('remote send delivers both ways with remote marker', { timeout: 90000 }, async () => {
+  const psk = randomBytes(32).toString('hex');
+  const A = spawnWorker('SA', SEND_A, [SEND_B], psk);
+  const B = spawnWorker('SB', SEND_B, [SEND_A], psk);
+  try {
+    const [readyA, readyB] = await Promise.all([A.wait('ready', 30000), B.wait('ready', 30000)]);
+    const textAB = `hello-remote-${Date.now()}`;
+    const sentAB = await remoteSend(A, readyB.peer.instanceId, textAB);
+    assert.equal(sentAB.type, 'sent');
+    assert.ok(['submitted', 'queued'].includes(sentAB.status), JSON.stringify(sentAB));
+    const gotB = await pollReceived(B, msgs => msgs.some(m => m.text === textAB));
+    const msgB = gotB.messages.find(m => m.text === textAB);
+    assert.ok(msgB.content.includes('remote 127.0.0.1'), msgB.content);
+    assert.equal(msgB.remoteMachine, '127.0.0.1');
+    const textBA = `reply-remote-${Date.now()}`;
+    const sentBA = await remoteSend(B, readyA.peer.instanceId, textBA);
+    assert.equal(sentBA.type, 'sent');
+    assert.ok(['submitted', 'queued'].includes(sentBA.status));
+    const gotA = await pollReceived(A, msgs => msgs.some(m => m.text === textBA));
+    assert.ok(gotA.messages.find(m => m.text === textBA).content.includes('remote 127.0.0.1'));
+    console.log(JSON.stringify({ evidence: 'remote send both ways via gateway relay', off: 'no listener, on works' }));
+  } finally { await closeWorkers([A, B]); }
+});
+
+test('remote rejects: wrong psk, goal scope, spoofed local identity, unknown target', { timeout: 90000 }, async () => {
+  const psk = randomBytes(32).toString('hex');
+  const A = spawnWorker('RA', SEND_A, [SEND_B], psk);
+  const B = spawnWorker('RB', SEND_B, [SEND_A], psk);
+  try {
+    const [readyA, readyB] = await Promise.all([A.wait('ready', 30000), B.wait('ready', 30000)]);
+    await assert.rejects(rawFirstFrame(SEND_B, 'cd'.repeat(32), { v: 1, type: 'remote-list', requestId: 'a1b2c3d4' }));
+    const goalRes = await remoteSend(A, readyB.peer.instanceId, 'goal-text', 'goal123');
+    assert.equal(goalRes.type, 'sendFailed');
+    assert.match(goalRes.error, /unsupported/);
+    assert.match(goalRes.error, /remote senders cannot use goal scope or bridges yet/);
+    const spoof = JSON.parse(await rawFirstFrame(SEND_B, psk, { v: 1, type: 'hello', requestId: 'd4e5f6a7', token: '', target: { id: readyB.peer.id, instanceId: readyB.peer.instanceId }, capabilities: ['cancel-safe-queue-v1'], from: { id: 'spoof', instanceId: readyB.peer.instanceId, name: 'spoof', remote: true } }));
+    assert.equal(spoof.ok, false);
+    assert.equal(spoof.status, 'authentication_failed');
+    const unknownId = '00'.repeat(16);
+    const missing = JSON.parse(await rawFirstFrame(SEND_B, psk, { v: 1, type: 'hello', requestId: 'e5f6a7b8', token: '', target: { id: 'x', instanceId: unknownId }, from: { id: 'r', instanceId: readyA.peer.instanceId, name: 'r', remote: true } }));
+    assert.equal(missing.ok, false);
+    assert.equal(missing.status, 'not_found');
+  } finally { await closeWorkers([A, B]); }
+});
+
+test('flag off: remote send not_found no listener; remote hello to unix socket rejected', { timeout: 30000 }, async () => {
+  const { component, wire } = await import('./support/component.mjs');
+  const { randomUUID } = await import('node:crypto');
+  const file = await writeSharedConfig(validConfig(SEND_OFF));
+  const a = await component('off-sender');
+  try {
+    await expectRefused(SEND_OFF);
+    await assert.rejects(a.tool('send_pi_message', { target: '00'.repeat(16), message: 'hi' }), /not_found/);
+  } finally { await a.close(); await fs.promises.rm(file, { force: true }); }
+  const off = await component('off-receiver2');
+  try {
+    const hello = { v: 1, type: 'hello', requestId: randomUUID(), token: off.peer.token, target: { id: off.peer.id, instanceId: off.peer.instanceId }, capabilities: ['cancel-safe-queue-v1'], from: { id: 'r', instanceId: randomBytes(16).toString('hex'), name: 'remote-guy', remote: true, machine: '127.0.0.1' } };
+    const reply = await wire(null, off, null, { hello });
+    assert.equal(reply.ok, false);
+    assert.equal(reply.status, 'authentication_failed');
+  } finally { await off.close(); }
 });
